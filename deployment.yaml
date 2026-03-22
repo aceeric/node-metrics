@@ -1,0 +1,88 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-metrics
+  labels:
+    app: node-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-metrics
+  template:
+    metadata:
+      labels:
+        app: node-metrics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: node-metrics-sa
+      initContainers:
+        # Installs the kubernetes Python client into a shared emptyDir volume
+        # so the main container can import it without baking it into an image.
+        - name: install-deps
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - pip install --quiet --no-cache-dir kubernetes --target /deps
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      containers:
+        - name: metrics
+          image: python:3.12-slim
+          command: ["python", "/app/metrics.py"]
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Set to a "key=value" label selector to restrict which nodes are counted.
+            # Leave empty to include all nodes. E.g. "kubernetes.io/role=worker"
+            - name: NODE_FILTER
+              value: ""
+            - name: METRICS_PORT
+              value: "8080"
+            # Makes packages installed by the initContainer importable.
+            - name: PYTHONPATH
+              value: /deps
+            - name: PYTHONUNBUFFERED
+              value: "True"
+            - name: COLLECTOR_SLEEP
+              value: "60"
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+            - name: deps
+              mountPath: /deps
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: script
+          configMap:
+            name: node-metrics-script
+        - name: deps
+          emptyDir: {}

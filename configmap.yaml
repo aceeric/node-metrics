@@ -1,0 +1,205 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-metrics-script
+  labels:
+    app: node-metrics
+data:
+  metrics.py: |
+    import os
+    import re
+    import signal
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from kubernetes import client, config
+
+    # ---------------------------------------------------------------------------
+    # Shared state
+    # ---------------------------------------------------------------------------
+    metrics_lock = threading.Lock()
+    shutdown_event = threading.Event()
+    metrics = {
+        "total_node_count": 0,
+        "total_node_memory_bytes": 0,
+        "total_pod_count": 0,
+        "total_pod_cpu_requests_millicores": 0,
+        "total_pod_memory_requests_bytes": 0,
+    }
+
+    METRIC_META = {
+        "total_node_count": {
+            "type": "gauge",
+            "help": "Total number of nodes in the cluster (optionally filtered by node label).",
+        },
+        "total_node_memory_bytes": {
+            "type": "gauge",
+            "help": "Total memory capacity of nodes in bytes (optionally filtered by node label).",
+        },
+        "total_pod_count": {
+            "type": "gauge",
+            "help": "Total number of pods in the cluster (optionally filtered by node label).",
+        },
+        "total_pod_cpu_requests_millicores": {
+            "type": "gauge",
+            "help": "Sum of all container CPU requests in milli-cores (optionally filtered by node label).",
+        },
+        "total_pod_memory_requests_bytes": {
+            "type": "gauge",
+            "help": "Sum of all container memory requests in bytes (optionally filtered by node label).",
+        },
+    }
+
+    # ---------------------------------------------------------------------------
+    # Unit helpers
+    # ---------------------------------------------------------------------------
+
+    def parse_memory(value: str) -> int:
+        """Convert a Kubernetes memory string (e.g. '16Gi', '512Mi') to bytes."""
+        suffixes = {
+            "Ki": 1024,
+            "Mi": 1024 ** 2,
+            "Gi": 1024 ** 3,
+            "Ti": 1024 ** 4,
+            "Pi": 1024 ** 5,
+            "K":  1000,
+            "M":  1000 ** 2,
+            "G":  1000 ** 3,
+            "T":  1000 ** 4,
+            "P":  1000 ** 5,
+        }
+        for suffix, multiplier in suffixes.items():
+            if value.endswith(suffix):
+                return int(value[: -len(suffix)]) * multiplier
+        return int(value)  # plain bytes
+
+
+    def parse_cpu(value: str) -> int:
+        """Convert a Kubernetes CPU string (e.g. '250m', '2') to milli-cores."""
+        if value.endswith("m"):
+            return int(value[:-1])
+        return int(float(value) * 1000)
+
+
+    # ---------------------------------------------------------------------------
+    # Collector loop
+    # ---------------------------------------------------------------------------
+
+    def collect_metrics():
+        """Runs in a background thread; refreshes metrics."""
+        # Load in-cluster config (falls back to kubeconfig for local dev)
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+
+        v1 = client.CoreV1Api()
+        collector_sleep = int(os.environ.get("COLLECTOR_SLEEP", "30"))
+        node_filter_raw = os.environ.get("NODE_FILTER", "").strip()
+
+        # Parse "key=value" label selector (empty string means no filter)
+        label_selector = node_filter_raw if node_filter_raw else None
+
+        while not shutdown_event.is_set():
+            try:
+                # ---- Nodes ----
+                node_list = v1.list_node(label_selector=label_selector)
+                print(f"node count: {len(node_list.items)}")
+                node_names = set()
+                total_memory = 0
+
+                for node in node_list.items:
+                    node_names.add(node.metadata.name)
+                    capacity = node.status.capacity or {}
+                    mem_str = capacity.get("memory", "0")
+                    total_memory += parse_memory(mem_str)
+
+                # ---- Pods (on matching nodes only) ----
+                # list_pod_for_all_namespaces does not support node label selectors
+                # directly, so we fetch all pods and filter by node name.
+                pod_list = v1.list_pod_for_all_namespaces()
+                print(f"pod count: {len(pod_list.items)}")
+                total_pods = 0
+                total_cpu_req = 0
+                total_mem_req = 0
+
+                for pod in pod_list.items:
+                    if label_selector and pod.spec.node_name not in node_names:
+                        continue
+                    total_pods += 1
+                    for container in pod.spec.containers:
+                        if container.resources and container.resources.requests:
+                            reqs = container.resources.requests
+                            if "cpu" in reqs:
+                                total_cpu_req += parse_cpu(reqs["cpu"])
+                            if "memory" in reqs:
+                                total_mem_req += parse_memory(reqs["memory"])
+
+                with metrics_lock:
+                    metrics["total_node_count"] = len(node_names)
+                    metrics["total_node_memory_bytes"] = total_memory
+                    metrics["total_pod_count"] = total_pods
+                    metrics["total_pod_cpu_requests_millicores"] = total_cpu_req
+                    metrics["total_pod_memory_requests_bytes"] = total_mem_req
+
+            except Exception as exc:  # noqa: BLE001
+                print(f"[collector] Error collecting metrics: {exc}")
+
+            shutdown_event.wait(timeout=collector_sleep)
+
+
+    # ---------------------------------------------------------------------------
+    # HTTP handler
+    # ---------------------------------------------------------------------------
+
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path not in ("/metrics", "/"):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            with metrics_lock:
+                snapshot = dict(metrics)
+
+            lines = []
+            for name, value in snapshot.items():
+                meta = METRIC_META[name]
+                lines.append(f"# TYPE {name} {meta['type']}")
+                lines.append(f"{name} {value}")
+                lines.append(f"# HELP {name} {meta['help']}")
+
+            body = "\n".join(lines) + "\n"
+            encoded = body.encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, fmt, *args):  # suppress default access log noise
+            pass
+
+
+    # ---------------------------------------------------------------------------
+    # Entry point
+    # ---------------------------------------------------------------------------
+
+    def _handle_sigterm(signum, frame):
+        print("[server] SIGTERM received, shutting down...")
+        shutdown_event.set()
+        server.shutdown()
+
+    if __name__ == "__main__":
+        collector_thread = threading.Thread(target=collect_metrics, daemon=True)
+        collector_thread.start()
+
+        port = int(os.environ.get("METRICS_PORT", "8080"))
+        server = HTTPServer(("0.0.0.0", port), MetricsHandler)
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+        print(f"[server] Serving Prometheus metrics on :{port}/metrics")
+        server.serve_forever()
+        print("[server] Shutdown complete.")

@@ -1,0 +1,19 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: node-metrics
+  labels:
+    app: node-metrics
+    # This label must match the labelSelector defined in your Prometheus CR.
+    # The default kube-prometheus-stack value is shown here; adjust if yours differs.
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: node-metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
